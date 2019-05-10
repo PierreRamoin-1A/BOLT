@@ -309,6 +309,12 @@ PrintSDTMarkers("print-sdt",
   cl::Hidden,
   cl::cat(BoltCategory));
 
+static cl::opt<bool>
+ProtectCustomSections("protect-custom-sections",
+  cl::desc("don't optimize section with __start_/__stop_ markers"),
+  cl::ZeroOrMore,
+  cl::cat(BoltCategory));
+
 static cl::opt<cl::boolOrDefault>
 RelocationMode("relocs",
   cl::desc("use relocations in the binary (default=autodetect)"),
@@ -450,6 +456,11 @@ bool isHotTextMover(const BinaryFunction &Function) {
 // Check against lists of functions from options if we should
 // optimize the function with a given name.
 bool shouldProcess(const BinaryFunction &Function) {
+  if (Function.getSection().isProtected()) {
+    DEBUG(dbgs() << "BOLT-DEBUG: " << Function
+                 << "No processed as section protected!!\n");
+    return false;
+  }
   if (opts::MaxFunctions &&
       Function.getFunctionNumber() >= opts::MaxFunctions) {
     if (Function.getFunctionNumber() == opts::MaxFunctions) {
@@ -1379,7 +1390,20 @@ void RewriteInstance::discoverFileObjects() {
     // their local labels. The only way to tell them apart is to look at
     // symbol scope - global vs local.
     if (cantFail(Symbol.getType()) != SymbolRef::ST_Function) {
-      if (PreviousFunction) {
+      StringRef SectionName;
+      Section->getName(SectionName);
+      auto BSection = BC->getUniqueSectionByName(SectionName);
+
+      if (opts::ProtectCustomSections &&
+        BSection->isSectionMarker(SymName, Address, SymbolSize)) {
+        if ((!BSection.getError()) && !BSection->isProtected()) {
+          outs() << "BOLT-INFO: Section protected: " << BSection->getName() << "\n";
+          BSection->setProtected(true);
+        }
+        DEBUG(dbgs() << "BOLT-DEBUG: symbol is a section marker, skipping\n");
+        registerName(SymbolSize);
+        continue;
+      } else if (PreviousFunction) {
         if (PreviousFunction->getSize() == 0) {
           if (PreviousFunction->isSymbolValidInScope(Symbol, SymbolSize)) {
             DEBUG(dbgs() << "BOLT-DEBUG: symbol is a function local symbol\n");
@@ -2056,6 +2080,11 @@ bool RewriteInstance::analyzeRelocation(const RelocationRef &Rel,
   if (!Relocation::isSupported(RType))
     return false;
 
+  auto Section = cantFail(Rel.getSymbol()->getSection());
+  auto BSection = BC->getSectionForAddress(Section->getAddress());
+  if (!BSection.getError() && BSection->isProtected())
+    return false;
+
   const bool IsAArch64 = BC->isAArch64();
 
   const auto RelSize = Relocation::getSizeForType(RType);
@@ -2082,11 +2111,21 @@ bool RewriteInstance::analyzeRelocation(const RelocationRef &Rel,
     IsSectionRelocation = false;
   } else {
     const auto &Symbol = *SymbolIter;
+    auto Section = Symbol.getSection();
     SymbolName = cantFail(Symbol.getName());
     SymbolAddress = cantFail(Symbol.getAddress());
     SkipVerification = (cantFail(Symbol.getType()) == SymbolRef::ST_Other);
     // Section symbols are marked as ST_Debug.
     IsSectionRelocation = (cantFail(Symbol.getType()) == SymbolRef::ST_Debug);
+    if (Section && *Section != InputFile->section_end()) {
+      auto BSection = BC->getSectionForAddress((*Section)->getAddress());
+      if (BSection && BSection->isProtected()) {
+        DEBUG(dbgs() << "Symbol " << SymbolName
+                     << " in protected section "
+                     << BSection->getName() << ", no relocation\n");
+        return false;
+      }
+    }
   }
 
   if (IsSectionRelocation && !IsAArch64) {
@@ -2179,8 +2218,13 @@ void RewriteInstance::readRelocations(const SectionRef &Section) {
     .Cases(".plt", ".rela.plt", ".got.plt", ".eh_frame", ".gcc_except_table",
            true)
     .Default(false);
+  auto BRelocSection = BC->getSectionForAddress(RelocatedSection.getAddress());
+  if ((!BRelocSection.getError()) &&
+      BRelocSection->isProtected())
+    DEBUG(dbgs() << "BOLT-DEBUG: ignoring relocations as protected section " << SectionName << "\n");
+    return;
   if (SkipRelocs) {
-    DEBUG(dbgs() << "BOLT-DEBUG: ignoring relocations against known section\n");
+    DEBUG(dbgs() << "BOLT-DEBUG: ignoring relocations against known section " << SectionName << "\n");
     return;
   }
 
@@ -2861,7 +2905,7 @@ void RewriteInstance::emitFunction(MCStreamer &Streamer,
   Section->setHasInstructions(true);
   BC->Ctx->addGenDwarfSection(Section);
 
-  if (BC->HasRelocations) {
+  if (BC->HasRelocations && !Function.getSection().isProtected()) {
     Streamer.EmitCodeAlignment(BinaryFunction::MinAlign);
     auto MaxAlignBytes = EmitColdPart
       ? Function.getMaxColdAlignmentBytes()
@@ -3199,6 +3243,12 @@ void RewriteInstance::mapCodeSections(orc::VModuleKey Key) {
     // Allocate sections starting at a given Address.
     auto allocateAt = [&](uint64_t Address) {
       for (auto *Section : CodeSections) {
+        if (Section->isProtected()) {
+          Section->setOutputAddress(Section->getAddress());
+          DEBUG(dbgs() << "Section protected, set output address to "
+                       << Section->getOutputAddress() << "\n");
+          continue;
+        }
         Address = alignTo(Address, Section->getAlignment());
         Section->setOutputAddress(Address);
         Address += Section->getOutputSize();
@@ -4302,11 +4352,15 @@ void RewriteInstance::patchELFSymTabs(ELFObjectFile<ELFT> *File) {
       const auto *Function = BC->getBinaryFunctionAtAddress(Symbol.st_value,
                                                             /*Shallow=*/true);
 
+      auto SymbolName = Symbol.getName(StringSection);
+      assert(SymbolName && "cannot get symbol name");
       // Some section symbols may be mistakenly associated with the first
-      // function emitted in the section. Dismiss if it is a section symbol.
+      // function emitted in the section, or with a section marker.
+      // Dismiss if it is a section symbol,
+      // or if the size is null (probably a marker).
       if (Function &&
           !Function->getPLTSymbol() &&
-          NewSymbol.getType() != ELF::STT_SECTION) {
+          NewSymbol.getType() != ELF::STT_SECTION && Symbol.st_size) {
         NewSymbol.st_value = Function->getOutputAddress();
         NewSymbol.st_size = Function->getOutputSize();
         NewSymbol.st_shndx = Function->getCodeSection()->getIndex();
@@ -4368,6 +4422,15 @@ void RewriteInstance::patchELFSymTabs(ELFObjectFile<ELFT> *File) {
                        Section->sh_flags & ELF::SHF_ALLOC &&
                        Section->sh_flags & ELF::SHF_EXECINSTR &&
                        !(Section->sh_flags & ELF::SHF_WRITE));
+
+          // A function can be at the same address than a section marker,
+          // So check if the symbol is one or the other.
+          auto BSection = BC->getSectionForAddress(Section->sh_addr);
+          if (!BSection.getError() &&
+              BSection->isSectionMarker(*SymbolName, Symbol.st_value,
+                                        Symbol.st_size)) {
+              Function = nullptr;
+          }
         } else {
           consumeError(ExpectedSec.takeError());
         }
@@ -4437,9 +4500,6 @@ void RewriteInstance::patchELFSymTabs(ELFObjectFile<ELFT> *File) {
           NewSymbol.st_value = 0;
         }
       }
-
-      auto SymbolName = Symbol.getName(StringSection);
-      assert(SymbolName && "cannot get symbol name");
 
       auto updateSymbolValue = [&](const StringRef Name, unsigned &IsUpdated) {
         NewSymbol.st_value = getNewValueForSymbol(Name);
